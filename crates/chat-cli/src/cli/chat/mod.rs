@@ -230,11 +230,15 @@ impl ChatArgs {
 
         // If modelId is specified, verify it exists before starting the chat
         let model_id: Option<String> = if let Some(model_name) = self.model {
+            let all_models = cli::model::get_all_model_options()?;
             let model_name_lower = model_name.to_lowercase();
-            match MODEL_OPTIONS.iter().find(|opt| opt.name == model_name_lower) {
-                Some(opt) => Some((opt.model_id).to_string()),
+            match all_models
+                .iter()
+                .find(|opt| opt.name.to_lowercase() == model_name_lower)
+            {
+                Some(opt) => Some(opt.model_id.clone()),
                 None => {
-                    let available_names: Vec<&str> = MODEL_OPTIONS.iter().map(|opt| opt.name).collect();
+                    let available_names: Vec<String> = all_models.iter().map(|opt| opt.name.clone()).collect();
                     bail!(
                         "Model '{}' does not exist. Available models: {}",
                         model_name,
