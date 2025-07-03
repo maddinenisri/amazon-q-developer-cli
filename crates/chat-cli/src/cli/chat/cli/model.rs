@@ -9,6 +9,7 @@ use crossterm::{
 };
 use dialoguer::Select;
 
+use crate::api_client::config::QCliConfig;
 use crate::cli::chat::{
     ChatError,
     ChatSession,
@@ -17,24 +18,72 @@ use crate::cli::chat::{
 use crate::os::Os;
 
 pub struct ModelOption {
+    pub name: String,
+    pub model_id: String,
+    pub is_custom: bool,
+}
+
+// Keep backward compatibility
+pub struct StaticModelOption {
     pub name: &'static str,
     pub model_id: &'static str,
 }
 
-pub const MODEL_OPTIONS: [ModelOption; 3] = [
-    ModelOption {
+pub const BUILTIN_MODEL_OPTIONS: [(&str, &str); 3] = [
+    ("claude-4-sonnet", "CLAUDE_SONNET_4_20250514_V1_0"),
+    ("claude-3.7-sonnet", "CLAUDE_3_7_SONNET_20250219_V1_0"),
+    ("claude-3.5-sonnet", "CLAUDE_3_5_SONNET_20241022_V2_0"),
+];
+
+// For backward compatibility with existing code
+pub const MODEL_OPTIONS: [StaticModelOption; 3] = [
+    StaticModelOption {
         name: "claude-4-sonnet",
         model_id: "CLAUDE_SONNET_4_20250514_V1_0",
     },
-    ModelOption {
+    StaticModelOption {
         name: "claude-3.7-sonnet",
         model_id: "CLAUDE_3_7_SONNET_20250219_V1_0",
     },
-    ModelOption {
+    StaticModelOption {
         name: "claude-3.5-sonnet",
         model_id: "CLAUDE_3_5_SONNET_20241022_V2_0",
     },
 ];
+
+pub fn get_all_model_options() -> Result<Vec<ModelOption>, ChatError> {
+    let mut models = Vec::new();
+
+    // Add built-in models
+    for (name, model_id) in BUILTIN_MODEL_OPTIONS.iter() {
+        models.push(ModelOption {
+            name: (*name).to_string(),
+            model_id: (*model_id).to_string(),
+            is_custom: false,
+        });
+    }
+
+    // Add custom models
+    match QCliConfig::load() {
+        Ok(config) => {
+            if let Some(custom_models) = &config.custom_models {
+                for (name, _custom_config) in custom_models.iter() {
+                    models.push(ModelOption {
+                        name: format!("custom:{}", name),
+                        model_id: format!("custom:{}", name),
+                        is_custom: true,
+                    });
+                }
+            }
+        },
+        Err(e) => {
+            // Log warning but don't fail - just continue with built-in models
+            eprintln!("Warning: Could not load custom models: {}", e);
+        },
+    }
+
+    Ok(models)
+}
 
 #[deny(missing_docs)]
 #[derive(Debug, PartialEq, Args)]
@@ -43,14 +92,17 @@ pub struct ModelArgs;
 impl ModelArgs {
     pub async fn execute(self, session: &mut ChatSession) -> Result<ChatState, ChatError> {
         queue!(session.stderr, style::Print("\n"))?;
+
+        let model_options = get_all_model_options()?;
         let active_model_id = session.conversation.model.as_deref();
-        let labels: Vec<String> = MODEL_OPTIONS
+
+        let labels: Vec<String> = model_options
             .iter()
             .map(|opt| {
-                if (opt.model_id.is_empty() && active_model_id.is_none()) || Some(opt.model_id) == active_model_id {
+                if Some(opt.model_id.as_str()) == active_model_id {
                     format!("{} (active)", opt.name)
                 } else {
-                    opt.name.to_owned()
+                    opt.name.clone()
                 }
             })
             .collect();
@@ -76,14 +128,19 @@ impl ModelArgs {
         queue!(session.stderr, style::ResetColor)?;
 
         if let Some(index) = selection {
-            let selected = &MODEL_OPTIONS[index];
-            let model_id_str = selected.model_id.to_string();
-            session.conversation.model = Some(model_id_str);
+            let selected = &model_options[index];
+            session.conversation.model = Some(selected.model_id.clone());
+
+            let display_name = if selected.is_custom {
+                format!("{} (Custom Model)", selected.name)
+            } else {
+                selected.name.clone()
+            };
 
             queue!(
                 session.stderr,
                 style::Print("\n"),
-                style::Print(format!(" Using {}\n\n", selected.name)),
+                style::Print(format!(" Using {}\n\n", display_name)),
                 style::ResetColor,
                 style::SetForegroundColor(Color::Reset),
                 style::SetBackgroundColor(Color::Reset),

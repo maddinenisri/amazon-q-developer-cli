@@ -1,4 +1,6 @@
+pub mod config;
 mod credentials;
+mod custom_model;
 pub mod customization;
 mod endpoints;
 mod error;
@@ -37,7 +39,9 @@ use tracing::{
     error,
 };
 
+use crate::api_client::config::QCliConfig;
 use crate::api_client::credentials::CredentialsChain;
+use crate::api_client::custom_model::CustomModelClient;
 use crate::api_client::model::{
     ChatResponseStream,
     ConversationState,
@@ -259,6 +263,19 @@ impl ApiClient {
 
         let model_id_opt: Option<String> = user_input_message.model_id.clone();
 
+        // Check if this is a custom model request
+        if let Some(model_id) = &model_id_opt {
+            if model_id.starts_with("custom:") {
+                return self
+                    .handle_custom_model_request(ConversationState {
+                        conversation_id,
+                        user_input_message,
+                        history,
+                    })
+                    .await;
+            }
+        }
+
         if let Some(client) = &self.streaming_client {
             let conversation_state = amzn_codewhisperer_streaming_client::types::ConversationState::builder()
                 .set_conversation_id(conversation_id)
@@ -421,6 +438,51 @@ impl ApiClient {
         } else {
             unreachable!("One of the clients must be created by this point");
         }
+    }
+
+    /// Handle custom model requests by routing to the appropriate proxy server
+    async fn handle_custom_model_request(
+        &self,
+        conversation: ConversationState,
+    ) -> Result<SendMessageOutput, ApiClientError> {
+        let model_id =
+            conversation
+                .user_input_message
+                .model_id
+                .as_ref()
+                .ok_or_else(|| ApiClientError::CustomModel {
+                    message: "Model ID is required for custom model requests".to_string(),
+                    status_code: None,
+                })?;
+
+        // Extract model name from "custom:model-name" format
+        let model_name = model_id
+            .strip_prefix("custom:")
+            .ok_or_else(|| ApiClientError::CustomModel {
+                message: "Invalid custom model ID format".to_string(),
+                status_code: None,
+            })?;
+
+        // Load custom model configuration
+        let config = QCliConfig::load().map_err(|e| ApiClientError::CustomModel {
+            message: format!("Failed to load custom model config: {}", e),
+            status_code: None,
+        })?;
+
+        let model_config = config
+            .get_custom_model(model_name)
+            .ok_or_else(|| ApiClientError::CustomModel {
+                message: format!("Custom model '{}' not found", model_name),
+                status_code: None,
+            })?;
+
+        // Create custom model HTTP client
+        let custom_client = CustomModelClient::new(model_config.clone())?;
+
+        // Use streaming endpoint
+        let stream = custom_client.send_message_stream(conversation, None, None).await?;
+
+        Ok(SendMessageOutput::CustomModel(stream))
     }
 
     /// Only meant for testing. Do not use outside of testing responses.

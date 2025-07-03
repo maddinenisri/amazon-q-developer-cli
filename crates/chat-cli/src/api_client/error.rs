@@ -93,6 +93,10 @@ pub enum ApiClientError {
     // Credential errors
     #[error("failed to load credentials: {}", .0)]
     Credentials(CredentialsError),
+
+    // Custom model errors
+    #[error("custom model error: {message}")]
+    CustomModel { message: String, status_code: Option<u16> },
 }
 
 impl ApiClientError {
@@ -116,6 +120,7 @@ impl ApiClientError {
             Self::ModelOverloadedError { status_code, .. } => *status_code,
             Self::MonthlyLimitReached { status_code } => *status_code,
             Self::Credentials(_e) => None,
+            Self::CustomModel { status_code, .. } => *status_code,
         }
     }
 }
@@ -141,6 +146,7 @@ impl ReasonCode for ApiClientError {
             Self::ModelOverloadedError { .. } => "ModelOverloadedError".to_string(),
             Self::MonthlyLimitReached { .. } => "MonthlyLimitReached".to_string(),
             Self::Credentials(_) => "CredentialsError".to_string(),
+            Self::CustomModel { .. } => "CustomModelError".to_string(),
         }
     }
 }
