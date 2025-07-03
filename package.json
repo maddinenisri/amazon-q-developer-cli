@@ -2,7 +2,10 @@
   "name": "root",
   "private": true,
   "author": "Amazon Web Services",
-  "repository": "https://github.com/aws/amazon-q-developer-cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aws/amazon-q-developer-cli.git"
+  },
   "license": "MIT OR Apache-2.0",
   "packageManager": "pnpm@10.0.0+sha256.43abf6e720fb7bc53c591b0862605c7d323d0a9d2dd33bcac07b062e13cf4948",
   "type": "module",
@@ -40,5 +43,16 @@
     "tsx": "^4.19.4",
     "turbo": "^2.5.2",
     "vitest": "^3.0.8"
-  }
+  },
+  "version": "1.0.0",
+  "description": "<p align=\"center\">   <a href=\"https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-installing.html\">     <picture>       <img src=\"./.github/media/amazon-q-logo.avif\" alt=\"Amazon Q\"         width=\"200px\"       >     </picture>   </a> </p>",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "keywords": [],
+  "bugs": {
+    "url": "https://github.com/aws/amazon-q-developer-cli/issues"
+  },
+  "homepage": "https://github.com/aws/amazon-q-developer-cli#readme"
 }
