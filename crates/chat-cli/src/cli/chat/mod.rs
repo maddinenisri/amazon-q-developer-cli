@@ -481,6 +481,10 @@ pub struct ChatSession {
     /// Pending prompts to be sent
     pending_prompts: VecDeque<Prompt>,
     interactive: bool,
+    /// Track if we're in a non-interactive multi-step task
+    non_interactive_task_active: bool,
+    /// Store the original non-interactive request for context
+    original_non_interactive_request: Option<String>,
     inner: Option<ChatState>,
 }
 
@@ -570,6 +574,8 @@ impl ChatSession {
             failed_request_ids: Vec::new(),
             pending_prompts: VecDeque::new(),
             interactive,
+            non_interactive_task_active: false,
+            original_non_interactive_request: None,
             inner: Some(ChatState::default()),
         })
     }
@@ -583,8 +589,15 @@ impl ChatSession {
             ChatState::PromptUser { skip_printing_tools } => {
                 match (self.interactive, self.tool_uses.is_empty()) {
                     (false, true) => {
-                        self.inner = Some(ChatState::Exit);
-                        return Ok(());
+                        // In non-interactive mode with no pending tools
+                        if self.non_interactive_task_active {
+                            // Check if we should continue the conversation
+                            return self.continue_non_interactive_task(os).await;
+                        } else {
+                            // Original behavior - exit immediately
+                            self.inner = Some(ChatState::Exit);
+                            return Ok(());
+                        }
                     },
                     (false, false) => {
                         return Err(ChatError::NonInteractiveToolApproval);
@@ -964,6 +977,11 @@ impl ChatSession {
         }
 
         if let Some(user_input) = self.initial_input.take() {
+            // If we're in non-interactive mode with initial input, track this as a potential multi-step task
+            if !self.interactive {
+                self.non_interactive_task_active = true;
+                self.original_non_interactive_request = Some(user_input.clone());
+            }
             self.inner = Some(ChatState::HandleInput { input: user_input });
         }
 
@@ -2090,6 +2108,82 @@ impl ChatSession {
         self.conversation.tools.values().flatten().all(|t| match t {
             FigTool::ToolSpecification(t) => self.tool_permissions.is_trusted(&t.name),
         })
+    }
+
+    async fn continue_non_interactive_task(&mut self, os: &mut Os) -> Result<(), ChatError> {
+        // Check if the conversation seems complete by analyzing recent messages
+        if self.is_non_interactive_task_complete() {
+            execute!(
+                self.stderr,
+                style::SetForegroundColor(Color::Green),
+                style::Print("✅ Non-interactive task completed successfully.\n"),
+                style::SetForegroundColor(Color::Reset)
+            )?;
+            self.non_interactive_task_active = false;
+            self.inner = Some(ChatState::Exit);
+            return Ok(());
+        }
+
+        // Continue the conversation by asking the model to proceed
+        let continuation_prompt = "Please continue with the next step in completing the requested task. If all steps are complete, please confirm completion.";
+
+        execute!(
+            self.stderr,
+            style::SetForegroundColor(Color::Cyan),
+            style::Print("🤖 Continuing with next steps...\n"),
+            style::SetForegroundColor(Color::Reset)
+        )?;
+
+        self.conversation
+            .set_next_user_message(continuation_prompt.to_string())
+            .await;
+
+        let conv_state = self
+            .conversation
+            .as_sendable_conversation_state(os, &mut self.stderr, true)
+            .await?;
+
+        self.inner = Some(ChatState::HandleResponseStream(
+            os.client.send_message(conv_state).await?,
+        ));
+
+        Ok(())
+    }
+
+    /// Determines if the non-interactive task appears to be complete
+    fn is_non_interactive_task_complete(&self) -> bool {
+        // Simple heuristic: if the last assistant message contains completion indicators
+        if let Some((_user_msg, assistant_msg)) = self.conversation.history().back() {
+            let content = match assistant_msg {
+                crate::cli::chat::message::AssistantMessage::Response { content, .. } => content,
+                crate::cli::chat::message::AssistantMessage::ToolUse { content, .. } => content,
+            };
+
+            let content_lower = content.to_lowercase();
+            // Look for completion indicators in the response
+            if content_lower.contains("completed")
+                || content_lower.contains("finished")
+                || content_lower.contains("done")
+                || content_lower.contains("successfully")
+                || (content_lower.contains("all")
+                    && (content_lower.contains("steps") || content_lower.contains("tasks")))
+                || content_lower.contains("ready to use")
+                || content_lower.contains("installation complete")
+            {
+                return true;
+            }
+        }
+
+        // If we've had several exchanges without new tool uses, likely complete
+        let recent_messages: Vec<_> = self.conversation.history().iter().rev().take(4).collect();
+        let has_recent_tools = recent_messages
+            .iter()
+            .any(|(_user_msg, assistant_msg)| match assistant_msg {
+                crate::cli::chat::message::AssistantMessage::ToolUse { .. } => true,
+                crate::cli::chat::message::AssistantMessage::Response { content, .. } => content.contains("🛠️"),
+            });
+
+        !has_recent_tools && recent_messages.len() >= 3
     }
 
     /// Display character limit warnings based on current conversation size
