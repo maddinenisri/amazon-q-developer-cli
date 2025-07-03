@@ -40,12 +40,20 @@ impl SendMessageOutput {
         use futures::StreamExt;
 
         match self {
-            SendMessageOutput::Codewhisperer(output) => Ok(output
-                .generate_assistant_response_response
-                .recv()
-                .await?
-                .map(|s| s.into())),
-            SendMessageOutput::QDeveloper(output) => Ok(output.send_message_response.recv().await?.map(|s| s.into())),
+            SendMessageOutput::Codewhisperer(output) => {
+                let event = output.generate_assistant_response_response.recv().await?;
+                if let Some(ref e) = event {
+                    tracing::debug!("Codewhisperer Event: {:#?}", e);
+                }
+                Ok(event.map(|s| s.into()))
+            },
+            SendMessageOutput::QDeveloper(output) => {
+                let event = output.send_message_response.recv().await?;
+                if let Some(ref e) = event {
+                    tracing::debug!("Q Developer Event: {:#?}", e);
+                }
+                Ok(event.map(|s| s.into()))
+            },
             SendMessageOutput::Mock(vec) => Ok(vec.pop()),
             SendMessageOutput::CustomModel(stream) => match stream.next().await {
                 Some(Ok(event)) => Ok(Some(event)),

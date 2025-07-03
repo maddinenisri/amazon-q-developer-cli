@@ -293,6 +293,9 @@ impl ApiClient {
                 .build()
                 .expect("building conversation should not fail");
 
+            // Log the Codewhisperer request for debugging
+            debug!("Codewhisperer Request: {:#?}", conversation_state);
+
             match client
                 .generate_assistant_response()
                 .conversation_state(conversation_state)
@@ -368,6 +371,9 @@ impl ApiClient {
                 )
                 .build()
                 .expect("building conversation_state should not fail");
+
+            // Log the Q Developer request for debugging
+            debug!("Q Developer Request: {:#?}", conversation_state);
 
             match client
                 .send_message()
