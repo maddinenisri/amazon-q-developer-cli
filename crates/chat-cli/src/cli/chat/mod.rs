@@ -2125,7 +2125,14 @@ impl ChatSession {
         }
 
         // Continue the conversation by asking the model to proceed
-        let continuation_prompt = "Please continue with the next step in completing the requested task. If all steps are complete, please confirm completion.";
+        let continuation_prompt = if let Some(original_request) = &self.original_non_interactive_request {
+            format!(
+                "Continue working on the task: '{}'. Please proceed with the next steps or confirm if the task is complete.",
+                original_request
+            )
+        } else {
+            "Please continue with the next step in completing the requested task. If all steps are complete, please confirm completion.".to_string()
+        };
 
         execute!(
             self.stderr,
@@ -2134,9 +2141,7 @@ impl ChatSession {
             style::SetForegroundColor(Color::Reset)
         )?;
 
-        self.conversation
-            .set_next_user_message(continuation_prompt.to_string())
-            .await;
+        self.conversation.set_next_user_message(continuation_prompt).await;
 
         let conv_state = self
             .conversation
