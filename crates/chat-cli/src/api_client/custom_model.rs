@@ -14,6 +14,7 @@ use crate::api_client::error::ApiClientError;
 use crate::api_client::model::{
     ChatResponseStream,
     ConversationState,
+    ToolResult,
 };
 
 /// Configuration for a custom model proxy endpoint
@@ -51,6 +52,187 @@ pub struct CustomModelRequest {
     pub system_prompt: Option<String>,
     /// Additional parameters for the model
     pub parameters: Option<HashMap<String, serde_json::Value>>,
+    /// Tool results from previous tool executions
+    pub tool_results: Option<Vec<ToolResult>>,
+}
+
+/// SSE parser that handles line buffering for proper event reconstruction
+struct SseParser {
+    buffer: String,
+    done_received: bool,
+}
+
+impl SseParser {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            done_received: false,
+        }
+    }
+
+    /// Parse a chunk of SSE data, returning events and whether the stream is complete
+    fn parse_chunk(&mut self, chunk: &str) -> (Vec<Result<ChatResponseStream, ApiClientError>>, bool) {
+        // Add chunk to buffer
+        self.buffer.push_str(chunk);
+
+        let mut events = Vec::new();
+
+        // Process complete lines from buffer
+        while let Some(line_end) = self.buffer.find('\n') {
+            let line = self.buffer[..line_end].to_string();
+            self.buffer.drain(..line_end + 1);
+
+            // Parse SSE line
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    debug!("Received [DONE] event - stream complete");
+                    self.done_received = true;
+                    // Don't break - continue processing any remaining buffered lines
+                    continue;
+                }
+
+                match serde_json::from_str::<serde_json::Value>(data) {
+                    Ok(event_json) => {
+                        // Write parsed event to file for analysis
+                        if let Ok(parsed_json) = serde_json::to_string_pretty(&event_json) {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            let filename = format!("custom_model_event_{}.json", timestamp);
+                            let _ = std::fs::write(filename, parsed_json);
+                        }
+
+                        if let Some(event) = Self::convert_proxy_event_to_chat_stream(&event_json) {
+                            events.push(Ok(event));
+                        }
+                    },
+                    Err(e) => {
+                        debug!("Failed to parse SSE event: {}", e);
+                        // Write failed parsing data to file for analysis
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let filename = format!("custom_model_parse_error_{}.txt", timestamp);
+                        let _ = std::fs::write(filename, format!("Error: {}\nData: {}", e, data));
+
+                        events.push(Err(ApiClientError::CustomModel {
+                            message: format!("Failed to parse streaming event: {}", e),
+                            status_code: None,
+                        }));
+                    },
+                }
+            }
+        }
+
+        (events, self.done_received)
+    }
+
+    /// Check if we've received the [DONE] event
+    fn is_done(&self) -> bool {
+        self.done_received
+    }
+
+    /// Process any remaining data in the buffer when stream ends
+    fn flush(&mut self) -> Vec<Result<ChatResponseStream, ApiClientError>> {
+        let mut events = Vec::new();
+
+        // If there's data in the buffer without a trailing newline, process it
+        if !self.buffer.is_empty() {
+            debug!("Flushing remaining buffer data: {}", self.buffer);
+
+            // Process as if it had a newline
+            let remaining = self.buffer.clone();
+            self.buffer.clear();
+
+            if let Some(data) = remaining.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    debug!("Found [DONE] in remaining buffer");
+                    self.done_received = true;
+                } else {
+                    match serde_json::from_str::<serde_json::Value>(data) {
+                        Ok(event_json) => {
+                            if let Some(event) = Self::convert_proxy_event_to_chat_stream(&event_json) {
+                                events.push(Ok(event));
+                            }
+                        },
+                        Err(e) => {
+                            debug!("Failed to parse remaining SSE event: {}", e);
+                            events.push(Err(ApiClientError::CustomModel {
+                                message: format!("Failed to parse final streaming event: {}", e),
+                                status_code: None,
+                            }));
+                        },
+                    }
+                }
+            }
+        }
+
+        events
+    }
+
+    /// Convert proxy server event to ChatResponseStream
+    fn convert_proxy_event_to_chat_stream(event: &serde_json::Value) -> Option<ChatResponseStream> {
+        let event_type = event.get("type")?.as_str()?;
+
+        match event_type {
+            "text_delta" => {
+                let text = event.get("text")?.as_str()?.to_string();
+                Some(ChatResponseStream::AssistantResponseEvent { content: text })
+            },
+            "tool_use_start" => {
+                let tool_use_id = event.get("tool_use_id")?.as_str()?.to_string();
+                let name = event.get("name")?.as_str()?.to_string();
+                Some(ChatResponseStream::ToolUseEvent {
+                    tool_use_id,
+                    name,
+                    input: None,
+                    stop: Some(false),
+                })
+            },
+            "tool_use_delta" => {
+                let tool_use_id = event.get("tool_use_id")?.as_str()?.to_string();
+                let name = event.get("name")?.as_str()?.to_string();
+                let input = event.get("input")?.as_str()?.to_string();
+                Some(ChatResponseStream::ToolUseEvent {
+                    tool_use_id,
+                    name,
+                    input: Some(input),
+                    stop: Some(false),
+                })
+            },
+            "content_block_stop" => {
+                // Check if this is a tool use block by looking for tool_use_id
+                if let (Some(tool_use_id), Some(name)) = (
+                    event.get("tool_use_id").and_then(|v| v.as_str()),
+                    event.get("name").and_then(|v| v.as_str()),
+                ) {
+                    Some(ChatResponseStream::ToolUseEvent {
+                        tool_use_id: tool_use_id.to_string(),
+                        name: name.to_string(),
+                        input: None,
+                        stop: Some(true), // This signals tool parsing completion and triggers execution
+                    })
+                } else {
+                    // Regular content block stop, not a tool use
+                    None
+                }
+            },
+            "message_start" => {
+                // Message started - no specific event needed
+                None
+            },
+            "message_end" => {
+                // Message ended - no specific event needed
+                None
+            },
+            _ => {
+                debug!("Unknown event type: {}", event_type);
+                None
+            },
+        }
+    }
 }
 
 /// Tool specification for the custom model
@@ -260,6 +442,13 @@ impl CustomModelClient {
                 operating_system: env_state.operating_system.clone(),
             });
 
+        // Extract tool results from context
+        let tool_results = conversation
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .and_then(|ctx| ctx.tool_results.clone());
+
         let request_body = CustomModelRequest {
             model_id: self.config.model_id.clone(),
             message: conversation.user_input_message.content,
@@ -269,6 +458,7 @@ impl CustomModelClient {
             env_context,
             system_prompt,
             parameters: None, // Can be extended for model-specific parameters
+            tool_results,
         };
 
         let mut request_builder = self
@@ -333,19 +523,41 @@ impl CustomModelClient {
         // Convert ConversationState to simplified format (same as non-streaming)
         let mut history = Vec::new();
         if let Some(chat_history) = &conversation.history {
-            for msg in chat_history {
+            for (i, msg) in chat_history.iter().enumerate() {
                 match msg {
                     crate::api_client::model::ChatMessage::UserInputMessage(user_msg) => {
-                        history.push(SimpleMessage {
-                            role: "user".to_string(),
-                            content: user_msg.content.clone(),
-                        });
+                        debug!(
+                            "Converting UserInputMessage {}: content length = {}, content = '{}'",
+                            i,
+                            user_msg.content.len(),
+                            user_msg.content
+                        );
+                        // Only include messages with non-empty content
+                        if !user_msg.content.trim().is_empty() {
+                            history.push(SimpleMessage {
+                                role: "user".to_string(),
+                                content: user_msg.content.clone(),
+                            });
+                        } else {
+                            debug!("Skipping empty UserInputMessage {}", i);
+                        }
                     },
                     crate::api_client::model::ChatMessage::AssistantResponseMessage(assistant_msg) => {
-                        history.push(SimpleMessage {
-                            role: "assistant".to_string(),
-                            content: assistant_msg.content.clone(),
-                        });
+                        debug!(
+                            "Converting AssistantResponseMessage {}: content length = {}, content = '{}'",
+                            i,
+                            assistant_msg.content.len(),
+                            assistant_msg.content
+                        );
+                        // Only include messages with non-empty content
+                        if !assistant_msg.content.trim().is_empty() {
+                            history.push(SimpleMessage {
+                                role: "assistant".to_string(),
+                                content: assistant_msg.content.clone(),
+                            });
+                        } else {
+                            debug!("Skipping empty AssistantResponseMessage {}", i);
+                        }
                     },
                 }
             }
@@ -391,16 +603,43 @@ impl CustomModelClient {
                 operating_system: env_state.operating_system.clone(),
             });
 
+        debug!(
+            "Current message content length = {}, content = '{}'",
+            conversation.user_input_message.content.len(),
+            conversation.user_input_message.content
+        );
+
+        // Handle empty current message by using a default prompt
+        let message_content = if conversation.user_input_message.content.trim().is_empty() {
+            debug!("Current message is empty, using default continuation prompt");
+            "Please continue with the next steps or confirm if the task is complete.".to_string()
+        } else {
+            conversation.user_input_message.content
+        };
+
+        // Extract tool results from context
+        let tool_results = conversation
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .and_then(|ctx| ctx.tool_results.clone());
+
         let request_body = CustomModelRequest {
             model_id: self.config.model_id.clone(),
-            message: conversation.user_input_message.content,
+            message: message_content,
             conversation_id: conversation_id.or(conversation.conversation_id),
             history: if history.is_empty() { None } else { Some(history) },
             tools,
             env_context,
             system_prompt,
             parameters: None,
+            tool_results,
         };
+
+        // Write custom model request to file for analysis
+        if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
+            let _ = std::fs::write("custom_model_request.json", request_json);
+        }
 
         // Build request to streaming endpoint
         let mut request_builder = self
@@ -435,121 +674,68 @@ impl CustomModelClient {
             });
         }
 
-        // Create stream from response bytes
+        // Create stream from response bytes with proper SSE buffering
         let byte_stream = response.bytes_stream();
 
-        // Convert Server-Sent Events to ChatResponseStream
+        // Use an SSE parser that properly handles line buffering
+        let sse_parser = std::sync::Arc::new(std::sync::Mutex::new(SseParser::new()));
+        let parser_for_map = sse_parser.clone();
+        let parser_for_take = sse_parser.clone();
+
+        // Process the stream in two phases:
+        // 1. Parse chunks until we see [DONE] or stream ends
+        // 2. Flush any remaining buffered data
+
         let chat_stream = byte_stream
-            .map(|chunk_result| {
+            .map(move |chunk_result| {
+                let mut parser = parser_for_map.lock().unwrap();
                 match chunk_result {
                     Ok(chunk) => {
                         let chunk_str = String::from_utf8_lossy(&chunk);
                         debug!("Received streaming chunk: {}", chunk_str);
 
-                        // Parse Server-Sent Events format
-                        Self::parse_sse_chunk(&chunk_str)
+                        // Write streaming chunk to file for analysis
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let filename = format!("custom_model_chunk_{}.txt", timestamp);
+                        let _ = std::fs::write(filename, chunk_str.as_bytes());
+
+                        // Parse Server-Sent Events format with buffering
+                        let (events, done) = parser.parse_chunk(&chunk_str);
+
+                        // If we received [DONE], this should be the last chunk
+                        if done {
+                            debug!("Stream complete - received [DONE] event");
+                            // Also flush any remaining data
+                            let mut all_events = events;
+                            all_events.extend(parser.flush());
+                            all_events
+                        } else {
+                            events
+                        }
                     },
-                    Err(e) => vec![Err(ApiClientError::CustomModel {
-                        message: format!("Stream error: {}", e),
-                        status_code: None,
-                    })],
+                    Err(e) => {
+                        // On error, flush any remaining data before reporting the error
+                        let mut events = parser.flush();
+                        events.push(Err(ApiClientError::CustomModel {
+                            message: format!("Stream error: {}", e),
+                            status_code: None,
+                        }));
+                        events
+                    },
                 }
+            })
+            .take_while(move |events| {
+                // Continue taking events until we've processed all data after [DONE]
+                let parser = parser_for_take.lock().unwrap();
+                let continue_stream = !events.is_empty() || !parser.is_done();
+                async move { continue_stream }
             })
             .flat_map(futures::stream::iter);
 
         Ok(Box::pin(chat_stream))
-    }
-
-    /// Parse Server-Sent Events chunk into ChatResponseStream events
-    fn parse_sse_chunk(chunk: &str) -> Vec<Result<ChatResponseStream, ApiClientError>> {
-        let mut events = Vec::new();
-
-        for line in chunk.lines() {
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    break;
-                }
-
-                match serde_json::from_str::<serde_json::Value>(data) {
-                    Ok(event_json) => {
-                        if let Some(event) = Self::convert_proxy_event_to_chat_stream(&event_json) {
-                            events.push(Ok(event));
-                        }
-                    },
-                    Err(e) => {
-                        debug!("Failed to parse SSE event: {}", e);
-                        events.push(Err(ApiClientError::CustomModel {
-                            message: format!("Failed to parse streaming event: {}", e),
-                            status_code: None,
-                        }));
-                    },
-                }
-            }
-        }
-
-        events
-    }
-
-    /// Convert proxy server event to ChatResponseStream
-    fn convert_proxy_event_to_chat_stream(event: &serde_json::Value) -> Option<ChatResponseStream> {
-        let event_type = event.get("type")?.as_str()?;
-
-        match event_type {
-            "text_delta" => {
-                let text = event.get("text")?.as_str()?.to_string();
-                Some(ChatResponseStream::AssistantResponseEvent { content: text })
-            },
-            "tool_use_start" => {
-                let tool_use_id = event.get("tool_use_id")?.as_str()?.to_string();
-                let name = event.get("name")?.as_str()?.to_string();
-                Some(ChatResponseStream::ToolUseEvent {
-                    tool_use_id,
-                    name,
-                    input: None, // Will be filled by subsequent tool_use_delta events
-                    stop: None,  // This is the start event, so no stop flag
-                })
-            },
-            "tool_use_delta" => {
-                // For tool use delta, we need to get the tool_use_id and name from context
-                // The proxy server should include these in the delta event
-                let input = event.get("input")?.as_str()?.to_string();
-                let tool_use_id = event
-                    .get("tool_use_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let name = event
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                Some(ChatResponseStream::ToolUseEvent {
-                    tool_use_id,
-                    name,
-                    input: Some(input),
-                    stop: Some(false), // Still streaming
-                })
-            },
-            "content_block_stop" => {
-                // End of a content block - this should NOT generate a ToolUseEvent
-                // The built-in parser handles tool completion internally
-                // Only generate events for text content blocks if needed
-                None
-            },
-            "message_stop" => {
-                // End of stream - no specific event needed as stream will end
-                None
-            },
-            "error" => {
-                // Error events are handled at the stream level
-                None
-            },
-            _ => {
-                debug!("Unknown event type: {}", event_type);
-                None
-            },
-        }
     }
 
     #[allow(dead_code)]

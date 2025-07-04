@@ -424,7 +424,7 @@ impl From<ToolUse> for amzn_qdeveloper_streaming_client::types::ToolUse {
 }
 
 /// A tool result that contains the results for a tool request that was previously made.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     /// The ID for the tool request.
     pub tool_use_id: String,
@@ -462,6 +462,35 @@ pub enum ToolResultContentBlock {
     Json(AwsDocument),
     /// A tool result that is text.
     Text(String),
+}
+
+impl Serialize for ToolResultContentBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ToolResultContentBlock::Json(doc) => {
+                // Convert AwsDocument to serde_json::Value for serialization
+                let value = serde_json::Value::String(format!("{:?}", doc));
+                value.serialize(serializer)
+            },
+            ToolResultContentBlock::Text(text) => text.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolResultContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(text) => Ok(ToolResultContentBlock::Text(text)),
+            _ => Ok(ToolResultContentBlock::Text(value.to_string())),
+        }
+    }
 }
 
 impl From<ToolResultContentBlock> for amzn_codewhisperer_streaming_client::types::ToolResultContentBlock {
