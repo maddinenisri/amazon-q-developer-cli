@@ -50,6 +50,7 @@ use crate::api_client::opt_out::OptOutInterceptor;
 use crate::api_client::send_message_output::SendMessageOutput;
 use crate::auth::builder_id::BearerResolver;
 use crate::aws_common::{
+    RequestLoggingInterceptor,
     UserAgentOverrideInterceptor,
     app_name,
     behavior_version,
@@ -103,6 +104,7 @@ impl ApiClient {
                 .http_client(crate::aws_common::http_client::client())
                 .interceptor(OptOutInterceptor::new(database))
                 .interceptor(UserAgentOverrideInterceptor::new())
+                .interceptor(RequestLoggingInterceptor::new())
                 .bearer_token_resolver(BearerResolver)
                 .app_name(app_name())
                 .endpoint_url(endpoint.url())
@@ -148,6 +150,7 @@ impl ApiClient {
                     .http_client(crate::aws_common::http_client::client())
                     .interceptor(OptOutInterceptor::new(database))
                     .interceptor(UserAgentOverrideInterceptor::new())
+                    .interceptor(RequestLoggingInterceptor::new())
                     .app_name(app_name())
                     .endpoint_url(endpoint.url())
                     .stalled_stream_protection(stalled_stream_protection_config())
@@ -160,6 +163,7 @@ impl ApiClient {
                         .http_client(crate::aws_common::http_client::client())
                         .interceptor(OptOutInterceptor::new(database))
                         .interceptor(UserAgentOverrideInterceptor::new())
+                        .interceptor(RequestLoggingInterceptor::new())
                         .bearer_token_resolver(BearerResolver)
                         .app_name(app_name())
                         .endpoint_url(endpoint.url())

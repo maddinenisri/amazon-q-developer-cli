@@ -93,30 +93,12 @@ impl SseParser {
 
                 match serde_json::from_str::<serde_json::Value>(data) {
                     Ok(event_json) => {
-                        // Write parsed event to file for analysis
-                        if let Ok(parsed_json) = serde_json::to_string_pretty(&event_json) {
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis();
-                            let filename = format!("custom_model_event_{}.json", timestamp);
-                            let _ = std::fs::write(filename, parsed_json);
-                        }
-
                         if let Some(event) = Self::convert_proxy_event_to_chat_stream(&event_json) {
                             events.push(Ok(event));
                         }
                     },
                     Err(e) => {
                         debug!("Failed to parse SSE event: {}", e);
-                        // Write failed parsing data to file for analysis
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let filename = format!("custom_model_parse_error_{}.txt", timestamp);
-                        let _ = std::fs::write(filename, format!("Error: {}\nData: {}", e, data));
-
                         events.push(Err(ApiClientError::CustomModel {
                             message: format!("Failed to parse streaming event: {}", e),
                             status_code: None,
@@ -636,11 +618,6 @@ impl CustomModelClient {
             tool_results,
         };
 
-        // Write custom model request to file for analysis
-        if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
-            let _ = std::fs::write("custom_model_request.json", request_json);
-        }
-
         // Build request to streaming endpoint
         let mut request_builder = self
             .http_client
@@ -693,14 +670,6 @@ impl CustomModelClient {
                     Ok(chunk) => {
                         let chunk_str = String::from_utf8_lossy(&chunk);
                         debug!("Received streaming chunk: {}", chunk_str);
-
-                        // Write streaming chunk to file for analysis
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let filename = format!("custom_model_chunk_{}.txt", timestamp);
-                        let _ = std::fs::write(filename, chunk_str.as_bytes());
 
                         // Parse Server-Sent Events format with buffering
                         let (events, done) = parser.parse_chunk(&chunk_str);
