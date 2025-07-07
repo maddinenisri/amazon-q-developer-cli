@@ -49,3 +49,7 @@ book/
 .env*
 
 run-build.sh
+
+# Proxy service logs
+proxy-service/proxy_logs.txt
+**/proxy_logs.txt
